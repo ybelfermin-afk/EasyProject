@@ -1,0 +1,1606 @@
+﻿import React, {
+ useState,
+ useEffect,
+ createContext,
+ useContext,
+ useRef,
+} from "react";
+import { initializeApp } from "firebase/app";
+import { getAuth, signInAnonymously, onAuthStateChanged } from "firebase/auth";
+import {
+ getFirestore,
+ doc,
+ getDoc,
+ addDoc,
+ setDoc,
+ updateDoc,
+ deleteDoc,
+ onSnapshot,
+ collection,
+ query,
+ where,
+ getDocs,
+} from "firebase/firestore";
+
+
+// html2canvas se carga desde CDN en el HTML, por lo que estará disponible globalmente.
+// No necesitamos importarlo ni declararlo aquí.
+
+
+// Tu objeto firebaseConfig REAL, incrustado directamente.
+const firebaseConfig = {
+ apiKey: "AIzaSyB4rTzW3MGESNv4X3H2b6GVOHuDqWUamQo",
+ authDomain: "my-app-de-gestion.firebaseapp.com",
+ projectId: "my-app-de-gestion",
+ storageBucket: "my-app-de-gestion.firebasestorage.app",
+ messagingSenderId: "101570572985",
+ appId: "1:101570572985:web:8d6638673a66b7c990a168",
+ measurementId: "G-PJK4XV72WG",
+};
+
+
+// Inicialización global de Firebase (fuera de cualquier componente o useEffect)
+const app = initializeApp(firebaseConfig);
+const db = getFirestore(app);
+const auth = getAuth(app);
+
+
+// Contexto para Firebase y autenticación
+const FirebaseContext = createContext(null);
+
+
+// Componente principal de la aplicación
+const App = () => {
+ const [userId, setUserId] = useState(null);
+ const [isAuthReady, setIsAuthReady] = useState(false);
+ const [currentPage, setCurrentPage] = useState("projectList"); // 'projectList' o 'projectView'
+ const [selectedProjectId, setSelectedProjectId] = useState(null);
+
+
+ // Estados para el modal de interacción personalizado (alerta/confirmación)
+ const [showCustomInteractionModal, setShowCustomInteractionModal] =
+   useState(false);
+ const [customInteractionMessage, setCustomInteractionMessage] = useState("");
+ const [customInteractionOnClose, setCustomInteractionOnClose] = useState(
+   () => () => setShowCustomInteractionModal(false)
+ );
+ const [customInteractionOnConfirm, setCustomInteractionOnConfirm] =
+   useState(null);
+ const [customInteractionShowCancel, setCustomInteractionShowCancel] =
+   useState(false);
+
+
+ // Función para mostrar una alerta personalizada
+ // CORRECCIÓN: Se ha añadido el tipo 'string' al parámetro 'message'.
+ const showAlert = (
+   message: string,
+   onClose = () => setShowCustomInteractionModal(false)
+ ) => {
+   setCustomInteractionMessage(message);
+   setCustomInteractionOnClose(() => onClose);
+   setCustomInteractionOnConfirm(null); // No es una confirmación
+   setCustomInteractionShowCancel(false);
+   setShowCustomInteractionModal(true);
+ };
+
+
+ // Función para mostrar una confirmación personalizada
+ // CORRECCIÓN: Se ha añadido el tipo 'string' al parámetro 'message'.
+ const showConfirm = (
+   message: string,
+   onConfirm: Function,
+   onCancel: Function = () => setShowCustomInteractionModal(false)
+ ) => {
+   setCustomInteractionMessage(message);
+   setCustomInteractionOnConfirm(() => onConfirm);
+   setCustomInteractionOnClose(() => onCancel);
+   setCustomInteractionShowCancel(true);
+   setShowCustomInteractionModal(true);
+ };
+
+
+ // Manejo del estado de autenticación (dentro del componente)
+ useEffect(() => {
+   const unsubscribe = onAuthStateChanged(auth, async (user) => {
+     if (user) {
+       setUserId(user.uid);
+     } else {
+       // Si no hay usuario, inicia sesión de forma anónima por defecto.
+       await signInAnonymously(auth);
+     }
+     setIsAuthReady(true);
+   });
+
+
+   return () => unsubscribe(); // Limpiar el listener al desmontar
+ }, []); // Dependencia vacía para que se ejecute solo una vez al montar
+
+
+ // Función para navegar a la vista de un proyecto específico
+ const goToProjectView = (projectId: string) => {
+   setSelectedProjectId(projectId);
+   setCurrentPage("projectView");
+ };
+
+
+ // Función para navegar de vuelta a la lista de proyectos
+ const goToProjectList = () => {
+   setSelectedProjectId(null);
+   setCurrentPage("projectList");
+ };
+
+
+ if (!isAuthReady) {
+   return (
+     <div className="flex items-center justify-center min-h-screen bg-gray-100 dark:bg-gray-900">
+       <div className="text-xl font-semibold text-gray-800 dark:text-gray-200">
+         Cargando aplicación...
+       </div>
+     </div>
+   );
+ }
+
+
+ return (
+   <FirebaseContext.Provider
+     value={{ db, auth, userId, isAuthReady, showAlert, showConfirm }}
+   >
+     <div className="min-h-screen bg-gray-100 dark:bg-gray-900 text-gray-900 dark:text-gray-100 font-inter">
+       {currentPage === "projectList" ? (
+         <ProjectList goToProjectView={goToProjectView} />
+       ) : (
+         <ProjectView
+           projectId={selectedProjectId}
+           goToProjectList={goToProjectList}
+         />
+       )}
+     </div>
+
+
+     {/* Modal de Interacción Personalizado (Alerta/Confirmación) */}
+     {showCustomInteractionModal && (
+       <CustomInteractionModal
+         message={customInteractionMessage}
+         onClose={customInteractionOnClose}
+         onConfirm={customInteractionOnConfirm}
+         showCancel={customInteractionShowCancel}
+       />
+     )}
+   </FirebaseContext.Provider>
+ );
+};
+
+
+// Componente para la lista de proyectos
+const ProjectList = ({ goToProjectView }) => {
+ const { db, userId, isAuthReady, showAlert } = useContext(FirebaseContext);
+ const [projects, setProjects] = useState([]);
+ const [showCreateModal, setShowCreateModal] = useState(false);
+ const [showJoinModal, setShowJoinCodeModal] = useState(false);
+ const [newProjectName, setNewProjectName] = useState("");
+ const [joinCode, setJoinCode] = useState("");
+ const [errorMessage, setErrorMessage] = useState("");
+
+
+ // Obtener el projectId de la configuración de Firebase (ahora global)
+ const projectId = firebaseConfig.projectId || "TU_PROJECT_ID_REAL_AQUI"; // Fallback por si acaso
+
+
+ useEffect(() => {
+   if (!db || !isAuthReady || !userId) return;
+
+
+   // Listener para los proyectos del usuario (propios y compartidos)
+   // La ruta de la colección ahora usa el projectId global
+   const q = query(
+     collection(db, `artifacts/${projectId}/public/data/projects`),
+     where("members", "array-contains", userId)
+   );
+   const unsubscribeProjects = onSnapshot(
+     q,
+     (snapshot) => {
+       const projectsData = snapshot.docs.map((doc) => ({
+         id: doc.id,
+         ...doc.data(),
+       }));
+       setProjects(projectsData);
+     },
+     (error) => {
+       console.error("Error fetching projects:", error);
+       setErrorMessage("Error al cargar proyectos.");
+     }
+   );
+
+
+   // No hay listener para userSettingsRef ni isUnlimited, ya que la app es gratuita
+
+
+   return () => {
+     unsubscribeProjects();
+   };
+ }, [db, userId, isAuthReady, projectId]); // Añadido projectId a las dependencias
+
+
+ // Crear un nuevo proyecto
+ const createProject = async () => {
+   if (!newProjectName.trim()) {
+     setErrorMessage("El nombre del proyecto no puede estar vacío.");
+     return;
+   }
+
+
+   // Lógica de pago eliminada: los proyectos ahora son ilimitados por defecto
+
+
+   try {
+     // La ruta de la colección ahora usa el projectId global
+     const projectsCollectionRef = collection(
+       db,
+       `artifacts/${projectId}/public/data/projects`
+     );
+     const newProjectRef = await addDoc(projectsCollectionRef, {
+       name: newProjectName,
+       ownerId: userId,
+       sharedCode: generateShareCode(),
+       members: [userId], // El creador es automáticamente miembro
+       // isPaid: isUnlimited, // Eliminado: ya no hay planes de pago
+       createdAt: new Date(),
+     });
+     console.log("Proyecto creado con ID:", newProjectRef.id);
+     setNewProjectName("");
+     setErrorMessage("");
+     setShowCreateModal(false);
+     goToProjectView(newProjectRef.id); // Ir directamente al proyecto creado
+   } catch (error) {
+     console.error("Error creating project:", error);
+     setErrorMessage("Error al crear el proyecto.");
+   }
+ };
+
+
+ // Unirse a un proyecto existente
+ const joinProject = async () => {
+   if (!joinCode.trim()) {
+     setErrorMessage("El código no puede estar vacío.");
+     return;
+   }
+   try {
+     // La ruta de la colección ahora usa el projectId global
+     const projectsCollectionRef = collection(
+       db,
+       `artifacts/${projectId}/public/data/projects`
+     );
+     const q = query(
+       projectsCollectionRef,
+       where("sharedCode", "==", joinCode)
+     );
+     const querySnapshot = await getDocs(q);
+
+
+     if (!querySnapshot.empty) {
+       const projectDoc = querySnapshot.docs[0];
+       const projectIdToJoin = projectDoc.id;
+       const projectData = projectDoc.data();
+
+
+       // Evitar unirse si ya es miembro
+       if (projectData.members.includes(userId)) {
+         setErrorMessage("Ya eres miembro de este proyecto.");
+         goToProjectView(projectIdToJoin);
+         return;
+       }
+
+
+       // Añadir al usuario como miembro
+       // La ruta del documento ahora usa el projectId global
+       await updateDoc(
+         doc(
+           db,
+           `artifacts/${projectId}/public/data/projects`,
+           projectIdToJoin
+         ),
+         {
+           members: [...projectData.members, userId],
+         }
+       );
+       console.log("Unido al proyecto:", projectIdToJoin);
+       setJoinCode("");
+       setErrorMessage("");
+       setShowJoinCodeModal(false);
+       goToProjectView(projectIdToJoin); // Ir directamente al proyecto unido
+     } else {
+       setErrorMessage("Código de proyecto inválido.");
+     }
+   } catch (error) {
+     console.error("Error joining project:", error);
+     setErrorMessage("Error al unirse al proyecto.");
+   }
+ };
+
+
+ // Generar un código de 6 caracteres alfanuméricos
+ const generateShareCode = () => {
+   return Math.random().toString(36).substring(2, 8).toUpperCase();
+ };
+
+
+ // handleUpgradeSuccess y PaymentModal eliminados
+
+
+ return (
+   <div className="container mx-auto p-6">
+     <h1 className="text-4xl font-bold mb-8 text-center text-blue-600 dark:text-blue-400">
+       Mis Proyectos
+     </h1>
+
+
+     <div className="mb-8 flex flex-col sm:flex-row justify-center gap-4">
+       <button
+         onClick={() => setShowCreateModal(true)}
+         className="bg-blue-500 hover:bg-blue-600 text-white font-bold py-3 px-6 rounded-lg shadow-md transition duration-300 ease-in-out transform hover:scale-105"
+       >
+         Crear Nuevo Proyecto
+       </button>
+       <button
+         onClick={() => setShowJoinCodeModal(true)}
+         className="bg-green-500 hover:bg-green-600 text-white font-bold py-3 px-6 rounded-lg shadow-md transition duration-300 ease-in-out transform hover:scale-105"
+       >
+         Unirse a un Proyecto
+       </button>
+     </div>
+
+
+     {errorMessage && (
+       <div
+         className="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded-lg relative mb-4"
+         role="alert"
+       >
+         <span className="block sm:inline">{errorMessage}</span>
+         <span
+           className="absolute top-0 bottom-0 right-0 px-4 py-3"
+           onClick={() => setErrorMessage("")}
+         >
+           <svg
+             className="fill-current h-6 w-6 text-red-500"
+             role="button"
+             xmlns="http://www.w3.org/2000/svg"
+             viewBox="0 0 20 20"
+           >
+             <title>Close</title>
+             <path d="M14.348 14.849a1.2 1.2 0 0 1-1.697 0L10 11.819l-2.651 3.029a1.2 1.2 0 1 1-1.697-1.697l2.758-3.15-2.759-3.152a1.2 1.2 0 1 1 1.697-1.697L10 8.183l2.651-3.031a1.2 1.2 0 1 1 1.697 1.697l-2.758 3.152 2.758 3.15a1.2 1.2 0 0 1 0 1.698z" />
+           </svg>
+         </span>
+       </div>
+     )}
+
+
+     <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+       {projects.length === 0 ? (
+         <p className="col-span-full text-center text-gray-600 dark:text-gray-400">
+           No tienes proyectos. ¡Crea uno o únete a uno!
+         </p>
+       ) : (
+         projects.map((project) => (
+           <div
+             key={project.id}
+             className="bg-white dark:bg-gray-800 rounded-lg shadow-lg p-6 cursor-pointer hover:shadow-xl transition-shadow duration-300 ease-in-out border border-gray-200 dark:border-gray-700"
+             onClick={() => goToProjectView(project.id)}
+           >
+             <h3 className="text-2xl font-semibold mb-2 text-blue-700 dark:text-blue-300">
+               {project.name}
+             </h3>
+             <p className="text-sm text-gray-600 dark:text-gray-400">
+               Creado por:{" "}
+               {project.ownerId === userId
+                 ? "Tú"
+                 : project.ownerId.substring(0, 8) + "..."}
+             </p>
+             {project.sharedCode && (
+               <p className="text-sm text-gray-600 dark:text-gray-400">
+                 Código:{" "}
+                 <span className="font-mono bg-gray-200 dark:bg-gray-700 px-2 py-1 rounded-md">
+                   {project.sharedCode}
+                 </span>
+               </p>
+             )}
+             {/* Eliminado: ya no hay indicación de proyecto "pagado" */}
+           </div>
+         ))
+       )}
+     </div>
+
+
+     {/* Modal para Crear Proyecto */}
+     {showCreateModal && (
+       <Modal
+         title="Crear Nuevo Proyecto"
+         onClose={() => setShowCreateModal(false)}
+       >
+         <input
+           type="text"
+           id="newProjectNameInput"
+           className="w-full p-3 mb-4 border border-gray-300 dark:border-gray-600 rounded-lg bg-gray-50 dark:bg-gray-700 text-gray-900 dark:text-gray-100 focus:ring-blue-500 focus:border-blue-500"
+           placeholder="Nombre del proyecto"
+           value={newProjectName}
+           onChange={(e) => setNewProjectName(e.target.value)}
+         />
+         <button
+           onClick={createProject}
+           className="w-full bg-blue-500 hover:bg-blue-600 text-white font-bold py-3 px-6 rounded-lg shadow-md transition duration-300 ease-in-out transform hover:scale-105"
+         >
+           Crear
+         </button>
+       </Modal>
+     )}
+
+
+     {/* Modal para Unirse a Proyecto */}
+     {showJoinModal && (
+       <Modal
+         title="Unirse a un Proyecto"
+         onClose={() => setShowJoinCodeModal(false)}
+       >
+         <input
+           type="text"
+           id="joinCodeInput"
+           className="w-full p-3 mb-4 border border-gray-300 dark:border-gray-600 rounded-lg bg-gray-50 dark:bg-gray-700 text-gray-900 dark:text-gray-100 focus:ring-blue-500 focus:border-blue-500"
+           placeholder="Código del proyecto"
+           value={joinCode}
+           onChange={(e) => setJoinCode(e.target.value)}
+         />
+         <button
+           onClick={joinProject}
+           className="w-full bg-green-500 hover:bg-green-600 text-white font-bold py-3 px-6 rounded-lg shadow-md transition duration-300 ease-in-out transform hover:scale-105"
+         >
+           Unirse
+         </button>
+       </Modal>
+     )}
+
+
+     {/* Modal de Pago/Actualización eliminado */}
+   </div>
+ );
+};
+
+
+// Componente para la vista de un proyecto (Gantt y Kanban)
+const ProjectView = ({ projectId, goToProjectList }) => {
+ const { db, userId, isAuthReady, showConfirm } = useContext(FirebaseContext);
+ const [project, setProject] = useState(null);
+ const [tasks, setTasks] = useState([]);
+ const [showTaskModal, setShowTaskModal] = useState(false);
+ const [editingTask, setEditingTask] = useState(null); // Para editar tareas existentes
+ const [activeTab, setActiveTab] = useState("kanban"); // 'kanban' o 'gantt'
+ const [showShareModal, setShowShareModal] = useState(false);
+ const [errorMessage, setErrorMessage] = useState("");
+
+
+ // Ref para el componente GanttChart para la exportación
+ const ganttChartRef = useRef(null);
+
+
+ // Obtener el projectId de la configuración de Firebase (ahora global)
+ const realProjectId = firebaseConfig.projectId || "TU_PROJECT_ID_REAL_AQUI"; // Fallback por si acaso
+
+
+ useEffect(() => {
+   if (!db || !isAuthReady || !projectId) return;
+
+
+   // Listener para el proyecto actual
+   // La ruta de la colección ahora usa el projectId global
+   const projectDocRef = doc(
+     db,
+     `artifacts/${realProjectId}/public/data/projects`,
+     projectId
+   );
+   const unsubscribeProject = onSnapshot(
+     projectDocRef,
+     (docSnap) => {
+       if (docSnap.exists()) {
+         setProject({ id: docSnap.id, ...docSnap.data() });
+       } else {
+         console.log("No such project!");
+         goToProjectList(); // Si el proyecto no existe, vuelve a la lista
+       }
+     },
+     (error) => {
+       console.error("Error fetching project:", error);
+       setErrorMessage("Error al cargar los detalles del proyecto.");
+     }
+   );
+
+
+   // Listener para las tareas del proyecto
+   // La ruta de la colección ahora usa el projectId global
+   const tasksCollectionRef = collection(
+     db,
+     `artifacts/${realProjectId}/public/data/projects/${projectId}/tasks`
+   );
+   const unsubscribeTasks = onSnapshot(
+     tasksCollectionRef,
+     (snapshot) => {
+       const tasksData = snapshot.docs.map((doc) => ({
+         id: doc.id,
+         ...doc.data(),
+       }));
+       // Ordenar por fase (si existe) y luego por fecha de inicio
+       setTasks(
+         tasksData.sort((a, b) => {
+           const phaseA = a.phase || "ZZZ"; // Default to ZZZ to put general tasks last
+           const phaseB = b.phase || "ZZZ";
+           if (phaseA < phaseB) return -1;
+           if (phaseA > phaseB) return 1;
+           return new Date(a.startDate) - new Date(b.startDate);
+         })
+       );
+     },
+     (error) => {
+       console.error("Error fetching tasks:", error);
+       setErrorMessage("Error al cargar las tareas.");
+     }
+   );
+
+
+   return () => {
+     unsubscribeProject();
+     unsubscribeTasks();
+   };
+ }, [db, projectId, isAuthReady, goToProjectList, realProjectId]); // Añadido realProjectId a las dependencias
+
+
+ // Añadir o actualizar tarea
+ const saveTask = async (taskData) => {
+   try {
+     // La ruta de la colección ahora usa el projectId global
+     const tasksCollectionRef = collection(
+       db,
+       `artifacts/${realProjectId}/public/data/projects/${projectId}/tasks`
+     );
+     if (editingTask) {
+       await updateDoc(doc(tasksCollectionRef, editingTask.id), taskData);
+       console.log("Tarea actualizada:", editingTask.id);
+     } else {
+       await addDoc(tasksCollectionRef, taskData);
+       console.log("Tarea añadida.");
+     }
+     setShowTaskModal(false);
+     setEditingTask(null);
+     setErrorMessage("");
+   } catch (error) {
+     console.error("Error saving task:", error);
+     setErrorMessage("Error al guardar la tarea.");
+   }
+ };
+
+
+ // Eliminar tarea usando el modal de confirmación personalizado
+ const deleteTask = (taskId) => {
+   showConfirm(
+     "¿Estás seguro de que quieres eliminar esta tarea?",
+     async () => {
+       // Callback de confirmación
+       try {
+         // La ruta del documento ahora usa el projectId global
+         await deleteDoc(
+           doc(
+             db,
+             `artifacts/${realProjectId}/public/data/projects/${projectId}/tasks`,
+             taskId
+           )
+         );
+         console.log("Tarea eliminada:", taskId);
+         setErrorMessage("");
+       } catch (error) {
+         console.error("Error deleting task:", error);
+         setErrorMessage("Error al eliminar la tarea.");
+       }
+     }
+   );
+ };
+
+
+ // Actualizar estado de tarea (para Kanban)
+ const updateTaskStatus = async (taskId, newStatus) => {
+   try {
+     // La ruta del documento ahora usa el projectId global
+     await updateDoc(
+       doc(
+         db,
+         `artifacts/${realProjectId}/public/data/projects/${projectId}/tasks`,
+         taskId
+       ),
+       {
+         status: newStatus,
+       }
+     );
+     console.log(`Tarea ${taskId} actualizada a estado: ${newStatus}`);
+     setErrorMessage("");
+   } catch (error) {
+     console.error("Error updating task status:", error);
+     setErrorMessage("Error al actualizar el estado de la tarea.");
+   }
+ };
+
+
+ if (!project) {
+   return (
+     <div className="flex items-center justify-center min-h-screen bg-gray-100 dark:bg-gray-900">
+       <div className="text-xl font-semibold text-gray-800 dark:text-gray-200">
+         Cargando proyecto...
+       </div>
+     </div>
+   );
+ }
+
+
+ return (
+   <div className="container mx-auto p-6">
+     <div className="flex justify-between items-center mb-8">
+       <button
+         onClick={goToProjectList}
+         className="bg-gray-300 hover:bg-gray-400 text-gray-800 font-bold py-2 px-4 rounded-lg shadow-md transition duration-300 ease-in-out"
+       >
+         &larr; Volver a Proyectos
+       </button>
+       <h1 className="text-4xl font-bold text-blue-600 dark:text-blue-400">
+         {project.name}
+       </h1>
+       <div className="flex gap-2">
+         <button
+           onClick={() => {
+             setEditingTask(null);
+             setShowTaskModal(true);
+           }}
+           className="bg-blue-500 hover:bg-blue-600 text-white font-bold py-2 px-4 rounded-lg shadow-md transition duration-300 ease-in-out transform hover:scale-105"
+         >
+           Añadir Tarea
+         </button>
+         <button
+           onClick={() => setShowShareModal(true)}
+           className="bg-purple-500 hover:bg-purple-600 text-white font-bold py-2 px-4 rounded-lg shadow-md transition duration-300 ease-in-out transform hover:scale-105"
+         >
+           Compartir
+         </button>
+         {activeTab === "gantt" && ( // Solo mostrar opciones de exportación/impresión en la vista de Gantt
+           <ExportPrintOptions ganttChartRef={ganttChartRef} />
+         )}
+       </div>
+     </div>
+
+
+     {errorMessage && (
+       <div
+         className="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded-lg relative mb-4"
+         role="alert"
+       >
+         <span className="block sm:inline">{errorMessage}</span>
+         <span
+           className="absolute top-0 bottom-0 right-0 px-4 py-3"
+           onClick={() => setErrorMessage("")}
+         >
+           <svg
+             className="fill-current h-6 w-6 text-red-500"
+             role="button"
+             xmlns="http://www.w3.org/2000/svg"
+             viewBox="0 0 20 20"
+           >
+             <title>Close</title>
+             <path d="M14.348 14.849a1.2 1.2 0 0 1-1.697 0L10 11.819l-2.651 3.029a1.2 1.2 0 1 1-1.697-1.697l2.758-3.15-2.759-3.152a1.2 1.2 0 1 1 1.697-1.697L10 8.183l2.651-3.031a1.2 1.2 0 1 1 1.697 1.697l-2.758 3.152 2.758 3.15a1.2 1.2 0 0 1 0 1.698z" />
+           </svg>
+         </span>
+       </div>
+     )}
+
+
+     {/* Selector de vista */}
+     <div className="flex justify-center mb-6">
+       <button
+         onClick={() => setActiveTab("kanban")}
+         className={`py-2 px-6 rounded-l-lg font-semibold transition duration-300 ease-in-out ${
+           activeTab === "kanban"
+             ? "bg-blue-600 text-white"
+             : "bg-gray-200 dark:bg-gray-700 text-gray-800 dark:text-gray-200"
+         }`}
+       >
+         Tablero Kanban
+       </button>
+       <button
+         onClick={() => setActiveTab("gantt")}
+         className={`py-2 px-6 rounded-r-lg font-semibold transition duration-300 ease-in-out ${
+           activeTab === "gantt"
+             ? "bg-blue-600 text-white"
+             : "bg-gray-200 dark:bg-gray-700 text-gray-800 dark:text-gray-200"
+         }`}
+       >
+         Diagrama de Gantt
+       </button>
+     </div>
+
+
+     {activeTab === "kanban" ? (
+       <KanbanBoard
+         tasks={tasks}
+         onEditTask={setEditingTask}
+         onDeleteTask={deleteTask}
+         onUpdateTaskStatus={updateTaskStatus}
+         setShowTaskModal={setShowTaskModal}
+       />
+     ) : (
+       <GanttChart
+         tasks={tasks}
+         onEditTask={setEditingTask}
+         onDeleteTask={deleteTask}
+         setShowTaskModal={setShowTaskModal}
+         ref={ganttChartRef}
+       />
+     )}
+
+
+     {/* Modal para Añadir/Editar Tarea */}
+     {showTaskModal && (
+       <TaskModal
+         key={editingTask ? editingTask.id : "new-task"} // Clave para forzar el remounting y resetear el estado
+         task={editingTask}
+         onSave={saveTask}
+         onClose={() => {
+           setShowTaskModal(false);
+           setEditingTask(null);
+         }}
+       />
+     )}
+
+
+     {/* Modal para Compartir Proyecto */}
+     {showShareModal && (
+       <ShareModal
+         projectCode={project.sharedCode}
+         onClose={() => setShowShareModal(false)}
+       />
+     )}
+   </div>
+ );
+};
+
+
+// Componente del Tablero Kanban
+const KanbanBoard = ({
+ tasks,
+ onEditTask,
+ onDeleteTask,
+ onUpdateTaskStatus,
+ setShowTaskModal,
+}) => {
+ const statuses = ["To Do", "In Progress", "Done"]; // Estados del Kanban
+
+
+ // Manejar el inicio del arrastre
+ const handleDragStart = (e, task) => {
+   e.dataTransfer.setData("taskId", task.id);
+ };
+
+
+ // Manejar el soltar en una columna
+ const handleDrop = (e, status) => {
+   e.preventDefault();
+   const taskId = e.dataTransfer.getData("taskId");
+   onUpdateTaskStatus(taskId, status);
+ };
+
+
+ // Prevenir el comportamiento por defecto de arrastre
+ const handleDragOver = (e) => {
+   e.preventDefault();
+ };
+
+
+ return (
+   <div className="flex flex-col md:flex-row gap-6">
+     {statuses.map((status) => (
+       <div
+         key={status}
+         className="flex-1 bg-gray-200 dark:bg-gray-800 rounded-lg p-4 shadow-inner min-w-[280px]"
+         onDrop={(e) => handleDrop(e, status)}
+         onDragOver={handleDragOver}
+       >
+         <h2 className="text-xl font-semibold mb-4 text-center text-gray-800 dark:text-gray-200 border-b pb-2 border-gray-300 dark:border-gray-700">
+           {status}
+         </h2>
+         <div className="flex flex-col gap-3">
+           {tasks
+             .filter((task) => task.status === status)
+             .map((task) => (
+               <div
+                 key={task.id}
+                 draggable
+                 onDragStart={(e) => handleDragStart(e, task)}
+                 className="bg-white dark:bg-gray-700 rounded-lg shadow-md p-4 cursor-grab active:cursor-grabbing border border-gray-300 dark:border-gray-600 hover:shadow-lg transition-shadow duration-200"
+               >
+                 <h3 className="font-bold text-lg text-blue-700 dark:text-blue-300 mb-1">
+                   {task.name}
+                 </h3>
+                 <p className="text-sm text-gray-600 dark:text-gray-400">
+                   Inicio: {new Date(task.startDate).toLocaleDateString()}
+                 </p>
+                 <p className="text-sm text-gray-600 dark:text-gray-400">
+                   Fin: {new Date(task.endDate).toLocaleDateString()}
+                 </p>
+                 <p className="text-sm text-gray-600 dark:text-gray-400">
+                   Responsable: {task.responsible}
+                 </p>
+                 <div className="flex justify-end gap-2 mt-3">
+                   <button
+                     onClick={(e) => {
+                       e.stopPropagation();
+                       onEditTask(task);
+                       setShowTaskModal(true);
+                     }}
+                     className="text-blue-500 hover:text-blue-700 transition-colors duration-200"
+                     title="Editar Tarea"
+                   >
+                     <svg
+                       xmlns="http://www.w3.org/2000/svg"
+                       className="h-5 w-5"
+                       viewBox="0 0 20 20"
+                       fill="currentColor"
+                     >
+                       <path d="M13.586 3.586a2 2 0 112.828 2.828l-.793.793-2.828-2.828.793-.793zM11.379 5.793L3 14.172V17h2.828l8.38-8.38-2.828-2.829z" />
+                     </svg>
+                   </button>
+                   <button
+                     onClick={(e) => {
+                       e.stopPropagation();
+                       onDeleteTask(task.id);
+                     }}
+                     className="text-red-500 hover:text-red-700 transition-colors duration-200"
+                     title="Eliminar Tarea"
+                   >
+                     <svg
+                       xmlns="http://www.w3.org/2000/svg"
+                       className="h-5 w-5"
+                       viewBox="0 0 20 20"
+                       fill="currentColor"
+                     >
+                       <path
+                         fillRule="evenodd"
+                         d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm5-1a1 1 0 00-1 1v6a1 1 0 102 0V8a1 1 0 00-1-1z"
+                         clipRule="evenodd"
+                       />
+                     </svg>
+                   </button>
+                 </div>
+               </div>
+             ))}
+           {tasks.filter((task) => task.status === status).length === 0 && (
+             <p className="text-center text-gray-500 dark:text-gray-400 text-sm italic">
+               Arrastra tareas aquí o añade una nueva.
+             </p>
+           )}
+         </div>
+       </div>
+     ))}
+   </div>
+ );
+};
+
+
+// Componente del Diagrama de Gantt (Simplificado y Mejorado)
+const GanttChart = React.forwardRef(
+ ({ tasks, onEditTask, onDeleteTask, setShowTaskModal }, ref) => {
+   // Calculate the overall date range for the Gantt chart
+   const allDates = tasks.flatMap((task) => [
+     new Date(task.startDate),
+     new Date(task.endDate),
+   ]);
+   let minDate =
+     allDates.length > 0 ? new Date(Math.min(...allDates)) : new Date();
+   let maxDate =
+     allDates.length > 0 ? new Date(Math.max(...allDates)) : new Date();
+
+
+   // Ensure the range is at least one month for better visualization
+   const oneMonthInMs = 30 * 24 * 60 * 60 * 1000;
+   if (maxDate.getTime() - minDate.getTime() < oneMonthInMs) {
+     maxDate.setMonth(minDate.getMonth() + 1);
+   }
+
+
+   // Normalize dates to start of the day
+   minDate.setHours(0, 0, 0, 0);
+   maxDate.setHours(0, 0, 0, 0);
+
+
+   // Generate all days within the calculated range
+   const days = [];
+   let currentDate = new Date(minDate);
+   while (currentDate <= maxDate) {
+     days.push(new Date(currentDate));
+     currentDate.setDate(currentDate.getDate() + 1);
+   }
+
+
+   // Function to get weekday initial
+   const getWeekdayInitial = (date) => {
+     const dayOfWeek = date.getDay(); // 0 = Sunday, 1 = Monday, ..., 6 = Saturday
+     switch (dayOfWeek) {
+       case 1:
+         return "L"; // Lunes
+       case 2:
+         return "M"; // Martes
+       case 3:
+         return "X"; // Miércoles
+       case 4:
+         return "J"; // Jueves
+       case 5:
+         return "V"; // Viernes
+       default:
+         return ""; // No show for Saturday/Sunday as per image
+     }
+   };
+
+
+   // Group days into weeks for the header
+   const weeks = [];
+   let currentWeekStart = new Date(minDate);
+   // Adjust currentWeekStart to the beginning of its week (Monday)
+   currentWeekStart.setDate(
+     currentWeekStart.getDate() - ((currentWeekStart.getDay() + 6) % 7)
+   ); // Monday of the week
+   currentWeekStart.setHours(0, 0, 0, 0);
+
+
+   let weekCounter = 1;
+   while (currentWeekStart <= maxDate) {
+     const weekEnd = new Date(currentWeekStart);
+     weekEnd.setDate(currentWeekStart.getDate() + 6); // End of the week (Sunday)
+     weeks.push({
+       start: new Date(currentWeekStart),
+       end: new Date(weekEnd),
+       name: `Semana ${weekCounter}`,
+     });
+     currentWeekStart.setDate(currentWeekStart.getDate() + 7); // Move to next week
+     weekCounter++;
+   }
+
+
+   // Function to calculate the style of the task bar
+   const getTaskBarStyle = (task) => {
+     const start = new Date(task.startDate);
+     const end = new Date(task.endDate);
+     const totalDays = (end.getTime() - start.getTime()) / (1000 * 3600 * 24);
+
+
+     // Calculate position relative to minDate
+     const offsetDays =
+       (start.getTime() - minDate.getTime()) / (1000 * 3600 * 24);
+
+
+     const cellWidth = 20; // Width of a day cell in pixels
+     const left = offsetDays * cellWidth;
+     const width = (totalDays + 1) * cellWidth; // +1 to include the end date
+
+
+     // Get color based on status
+     let bgColor = "";
+     switch (task.status) {
+       case "To Do":
+         bgColor = "bg-gray-500";
+         break;
+       case "In Progress":
+         bgColor = "bg-yellow-500";
+         break;
+       case "Done":
+         bgColor = "bg-green-500";
+         break;
+       default:
+         bgColor = "bg-blue-500";
+     }
+
+
+     return {
+       left: `${left}px`,
+       width: `${width}px`,
+       backgroundColor: "transparent",
+       className: `absolute top-0 h-8 rounded-full shadow-lg flex items-center justify-center p-1 cursor-pointer transition-all duration-200 ease-in-out hover:scale-105 ${bgColor}`,
+     };
+   };
+
+
+   const groupedTasks = tasks.reduce((acc, task) => {
+     const phase = task.phase || "Tareas Generales";
+     if (!acc[phase]) {
+       acc[phase] = [];
+     }
+     acc[phase].push(task);
+     return acc;
+   }, {});
+
+
+   return (
+     <div
+       ref={ref}
+       className="overflow-x-auto bg-white dark:bg-gray-800 rounded-lg shadow-xl p-4"
+     >
+       <div className="inline-block min-w-full">
+         {/* Gantt Chart Header */}
+         <div className="flex sticky top-0 bg-white dark:bg-gray-800 z-10 shadow-md">
+           {/* Task Name Column Header */}
+           <div
+             className="flex-none p-2 border-r border-b dark:border-gray-700 font-bold"
+             style={{ width: "200px" }}
+           >
+             Tarea
+           </div>
+           {/* Timeline Header */}
+           <div className="flex-1 overflow-hidden">
+             <div
+               className="flex"
+               style={{ width: `${days.length * 20}px` }}
+             >
+               {weeks.map((week, index) => (
+                 <div
+                   key={index}
+                   className="text-center text-sm font-semibold p-2 border-b dark:border-gray-700"
+                   style={{
+                     width: `${
+                       (week.end.getTime() - week.start.getTime()) /
+                         (1000 * 3600 * 24) * 20 + 20
+                     }px`, // +20 to account for the last day
+                   }}
+                 >
+                   {week.name}
+                 </div>
+               ))}
+             </div>
+             <div
+               className="flex"
+               style={{ width: `${days.length * 20}px` }}
+             >
+               {days.map((day, index) => (
+                 <div
+                   key={index}
+                   className="flex-none text-center text-xs p-1 border-b border-r dark:border-gray-700 font-mono"
+                   style={{ width: "20px" }}
+                 >
+                   <div className="mb-1 text-gray-500 dark:text-gray-400">
+                     {getWeekdayInitial(day)}
+                   </div>
+                   <div>{day.getDate()}</div>
+                 </div>
+               ))}
+             </div>
+           </div>
+         </div>
+
+
+         {/* Gantt Chart Body */}
+         {Object.entries(groupedTasks).map(([phase, phaseTasks]) => (
+           <div key={phase} className="mt-4">
+             <div
+               className="flex items-center text-left bg-gray-100 dark:bg-gray-900 font-bold text-lg p-2 sticky left-0 z-10"
+               style={{ width: "200px" }}
+             >
+               {phase}
+             </div>
+             {phaseTasks.map((task, index) => {
+               const { left, width, className, backgroundColor } =
+                 getTaskBarStyle(task);
+               return (
+                 <div
+                   key={task.id}
+                   className="flex relative border-b dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors duration-200"
+                   style={{ height: "40px" }}
+                 >
+                   {/* Task Name Cell */}
+                   <div
+                     className="flex-none flex items-center p-2 border-r dark:border-gray-700 sticky left-0 z-10 bg-white dark:bg-gray-800"
+                     style={{ width: "200px" }}
+                   >
+                     <span className="font-semibold text-blue-700 dark:text-blue-300 truncate">
+                       {task.name}
+                     </span>
+                     <div className="ml-auto flex gap-2">
+                       <button
+                         onClick={() => {
+                           onEditTask(task);
+                           setShowTaskModal(true);
+                         }}
+                         className="text-blue-500 hover:text-blue-700 transition-colors duration-200"
+                         title="Editar Tarea"
+                       >
+                         <svg
+                           xmlns="http://www.w3.org/2000/svg"
+                           className="h-4 w-4"
+                           viewBox="0 0 20 20"
+                           fill="currentColor"
+                         >
+                           <path d="M13.586 3.586a2 2 0 112.828 2.828l-.793.793-2.828-2.828.793-.793zM11.379 5.793L3 14.172V17h2.828l8.38-8.38-2.828-2.829z" />
+                         </svg>
+                       </button>
+                       <button
+                         onClick={() => onDeleteTask(task.id)}
+                         className="text-red-500 hover:text-red-700 transition-colors duration-200"
+                         title="Eliminar Tarea"
+                       >
+                         <svg
+                           xmlns="http://www.w3.org/2000/svg"
+                           className="h-4 w-4"
+                           viewBox="0 0 20 20"
+                           fill="currentColor"
+                         >
+                           <path
+                             fillRule="evenodd"
+                             d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm5-1a1 1 0 00-1 1v6a1 1 0 102 0V8a1 1 0 00-1-1z"
+                             clipRule="evenodd"
+                           />
+                         </svg>
+                       </button>
+                     </div>
+                   </div>
+                   {/* Timeline Cell */}
+                   <div
+                     className="flex-1 relative"
+                     style={{ height: "40px", backgroundColor: "transparent" }}
+                   >
+                     <div
+                       className={className}
+                       style={{
+                         left,
+                         width,
+                         backgroundColor,
+                       }}
+                     >
+                       <span className="text-white text-xs font-semibold px-2 truncate">
+                         {task.name}
+                       </span>
+                     </div>
+                   </div>
+                 </div>
+               );
+             })}
+           </div>
+         ))}
+       </div>
+     </div>
+   );
+ }
+);
+
+
+const ExportPrintOptions = ({ ganttChartRef }) => {
+ const handleExportPNG = async () => {
+   if (ganttChartRef.current) {
+     try {
+       const canvas = await window.html2canvas(ganttChartRef.current, {
+         scale: 2, // Aumentar la escala para mejor calidad
+         useCORS: true,
+       });
+       const link = document.createElement("a");
+       link.download = "gantt-chart.png";
+       link.href = canvas.toDataURL("image/png");
+       link.click();
+     } catch (error) {
+       console.error("Error exporting Gantt chart:", error);
+       alert(
+         "No se pudo exportar el diagrama. Por favor, inténtalo de nuevo."
+       );
+     }
+   }
+ };
+
+
+ const handlePrint = () => {
+   if (ganttChartRef.current) {
+     const content = ganttChartRef.current.outerHTML;
+     const printWindow = window.open("", "_blank");
+     printWindow.document.write(`
+       <!DOCTYPE html>
+       <html>
+       <head>
+         <title>Diagrama de Gantt</title>
+         <style>
+           @media print {
+             body {
+               margin: 0;
+               padding: 0;
+             }
+             body > * {
+               visibility: hidden;
+             }
+             .gantt-container {
+               visibility: visible;
+               display: block;
+               position: absolute;
+               left: 0;
+               top: 0;
+               width: 100%;
+               overflow: visible !important;
+             }
+             .gantt-container .sticky {
+               position: static !important;
+             }
+           }
+         </style>
+       </head>
+       <body>
+         <div class="gantt-container">
+           ${content}
+         </div>
+         <script>
+           window.onload = function() {
+             window.print();
+             window.close();
+           };
+         </script>
+       </body>
+       </html>
+     `);
+     printWindow.document.close();
+   }
+ };
+
+
+ return (
+   <>
+     <button
+       onClick={handleExportPNG}
+       className="bg-gray-500 hover:bg-gray-600 text-white font-bold py-2 px-4 rounded-lg shadow-md transition duration-300 ease-in-out transform hover:scale-105"
+       title="Exportar como PNG"
+     >
+       <svg
+         xmlns="http://www.w3.org/2000/svg"
+         className="h-5 w-5"
+         viewBox="0 0 20 20"
+         fill="currentColor"
+       >
+         <path
+           fillRule="evenodd"
+           d="M3 17a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zM6.293 6.707a1 1 0 010-1.414L9.586 2.586a1 1 0 011.414 0l3.293 3.293a1 1 0 01-1.414 1.414L11 5.414V13a1 1 0 11-2 0V5.414L6.707 6.707a1 1 0 01-1.414 0z"
+           clipRule="evenodd"
+         />
+       </svg>
+     </button>
+     <button
+       onClick={handlePrint}
+       className="bg-gray-500 hover:bg-gray-600 text-white font-bold py-2 px-4 rounded-lg shadow-md transition duration-300 ease-in-out transform hover:scale-105"
+       title="Imprimir"
+     >
+       <svg
+         xmlns="http://www.w3.org/2000/svg"
+         className="h-5 w-5"
+         viewBox="0 0 20 20"
+         fill="currentColor"
+       >
+         <path
+           fillRule="evenodd"
+           d="M5 4v3H4a2 2 0 00-2 2v3a2 2 0 002 2h1v2a2 2 0 002 2h6a2 2 0 002-2v-2h1a2 2 0 002-2V9a2 2 0 00-2-2h-1V4a2 2 0 00-2-2H7a2 2 0 00-2 2zm0 5H4v3h1V9zm1-1h8V4H6v4zm8 1v3h1V9h-1z"
+           clipRule="evenodd"
+         />
+       </svg>
+     </button>
+   </>
+ );
+};
+
+
+// Modal de Compartir
+const ShareModal = ({ projectCode, onClose }) => {
+ const [isCopied, setIsCopied] = useState(false);
+
+
+ const handleCopy = () => {
+   // Usamos el método `execCommand` para mayor compatibilidad
+   const el = document.createElement("textarea");
+   el.value = projectCode;
+   document.body.appendChild(el);
+   el.select();
+   document.execCommand("copy");
+   document.body.removeChild(el);
+
+
+   setIsCopied(true);
+   setTimeout(() => setIsCopied(false), 2000); // Resetear el estado después de 2 segundos
+ };
+
+
+ return (
+   <Modal title="Compartir Proyecto" onClose={onClose}>
+     <p className="text-gray-700 dark:text-gray-300 mb-4">
+       Comparte este código con tus colaboradores para que puedan unirse al
+       proyecto.
+     </p>
+     <div className="flex items-center gap-2">
+       <span className="font-mono bg-gray-200 dark:bg-gray-700 text-gray-900 dark:text-gray-100 p-3 rounded-lg flex-1 text-center">
+         {projectCode}
+       </span>
+       <button
+         onClick={handleCopy}
+         className={`px-4 py-2 rounded-lg font-semibold transition duration-300 ease-in-out ${
+           isCopied
+             ? "bg-green-500 text-white"
+             : "bg-blue-500 hover:bg-blue-600 text-white"
+         }`}
+       >
+         {isCopied ? (
+           <svg
+             xmlns="http://www.w3.org/2000/svg"
+             className="h-6 w-6"
+             viewBox="0 0 20 20"
+             fill="currentColor"
+           >
+             <path
+               fillRule="evenodd"
+               d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z"
+               clipRule="evenodd"
+             />
+           </svg>
+         ) : (
+           <svg
+             xmlns="http://www.w3.org/2000/svg"
+             className="h-6 w-6"
+             viewBox="0 0 20 20"
+             fill="currentColor"
+           >
+             <path d="M8 2a2 2 0 00-2 2v3h2V4h3.586l-1.457 1.457a1 1 0 001.414 1.414L10 6.414V8a2 2 0 002 2h3a2 2 0 012 2v5a2 2 0 01-2 2H6a2 2 0 01-2-2v-5a2 2 0 012-2h2V9H6a4 4 0 00-4 4v5a4 4 0 004 4h9a4 4 0 004-4v-5a4 4 0 00-4-4H8a2 2 0 00-2 2v2H4V4h4zm-1 7a1 1 0 00-1-1v3a1 1 0 001 1h3a1 1 0 001-1V8a1 1 0 00-1-1h-3z" />
+           </svg>
+         )}
+       </button>
+     </div>
+   </Modal>
+ );
+};
+
+
+// Modal de Tarea (Añadir/Editar)
+const TaskModal = ({ task, onSave, onClose }) => {
+ const [name, setName] = useState(task?.name || "");
+ const [description, setDescription] = useState(task?.description || "");
+ const [responsible, setResponsible] = useState(task?.responsible || "");
+ const [startDate, setStartDate] = useState(
+   task?.startDate || new Date().toISOString().substring(0, 10)
+ );
+ const [endDate, setEndDate] = useState(
+   task?.endDate || new Date().toISOString().substring(0, 10)
+ );
+ const [phase, setPhase] = useState(task?.phase || "");
+ const [status, setStatus] = useState(task?.status || "To Do");
+ const [errorMessage, setErrorMessage] = useState("");
+
+
+ const handleSubmit = (e) => {
+   e.preventDefault();
+   if (!name || !startDate || !endDate) {
+     setErrorMessage("El nombre, la fecha de inicio y la de fin son obligatorios.");
+     return;
+   }
+   if (new Date(startDate) > new Date(endDate)) {
+     setErrorMessage("La fecha de inicio no puede ser posterior a la de fin.");
+     return;
+   }
+   onSave({ name, description, responsible, startDate, endDate, phase, status });
+ };
+
+
+ return (
+   <Modal title={task ? "Editar Tarea" : "Añadir Tarea"} onClose={onClose}>
+     <form onSubmit={handleSubmit} className="space-y-4">
+       {errorMessage && (
+         <div
+           className="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded-lg"
+           role="alert"
+         >
+           {errorMessage}
+         </div>
+       )}
+       <div>
+         <label
+           htmlFor="taskName"
+           className="block text-sm font-medium text-gray-700 dark:text-gray-300"
+         >
+           Nombre de la Tarea
+         </label>
+         <input
+           type="text"
+           id="taskName"
+           value={name}
+           onChange={(e) => setName(e.target.value)}
+           className="mt-1 block w-full p-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm focus:ring-blue-500 focus:border-blue-500 bg-gray-50 dark:bg-gray-700 text-gray-900 dark:text-gray-100"
+           required
+         />
+       </div>
+       <div>
+         <label
+           htmlFor="taskDescription"
+           className="block text-sm font-medium text-gray-700 dark:text-gray-300"
+         >
+           Descripción
+         </label>
+         <textarea
+           id="taskDescription"
+           value={description}
+           onChange={(e) => setDescription(e.target.value)}
+           rows={3}
+           className="mt-1 block w-full p-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm focus:ring-blue-500 focus:border-blue-500 bg-gray-50 dark:bg-gray-700 text-gray-900 dark:text-gray-100"
+         />
+       </div>
+       <div>
+         <label
+           htmlFor="taskResponsible"
+           className="block text-sm font-medium text-gray-700 dark:text-gray-300"
+         >
+           Responsable
+         </label>
+         <input
+           type="text"
+           id="taskResponsible"
+           value={responsible}
+           onChange={(e) => setResponsible(e.target.value)}
+           className="mt-1 block w-full p-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm focus:ring-blue-500 focus:border-blue-500 bg-gray-50 dark:bg-gray-700 text-gray-900 dark:text-gray-100"
+         />
+       </div>
+       <div>
+         <label
+           htmlFor="taskPhase"
+           className="block text-sm font-medium text-gray-700 dark:text-gray-300"
+         >
+           Fase del Proyecto
+         </label>
+         <input
+           type="text"
+           id="taskPhase"
+           value={phase}
+           onChange={(e) => setPhase(e.target.value)}
+           className="mt-1 block w-full p-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm focus:ring-blue-500 focus:border-blue-500 bg-gray-50 dark:bg-gray-700 text-gray-900 dark:text-gray-100"
+           placeholder="Ej: Planificación, Desarrollo, Pruebas"
+         />
+       </div>
+       <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+         <div>
+           <label
+             htmlFor="taskStartDate"
+             className="block text-sm font-medium text-gray-700 dark:text-gray-300"
+           >
+             Fecha de Inicio
+           </label>
+           <input
+             type="date"
+             id="taskStartDate"
+             value={startDate}
+             onChange={(e) => setStartDate(e.target.value)}
+             className="mt-1 block w-full p-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm focus:ring-blue-500 focus:border-blue-500 bg-gray-50 dark:bg-gray-700 text-gray-900 dark:text-gray-100"
+             required
+           />
+         </div>
+         <div>
+           <label
+             htmlFor="taskEndDate"
+             className="block text-sm font-medium text-gray-700 dark:text-gray-300"
+           >
+             Fecha de Fin
+           </label>
+           <input
+             type="date"
+             id="taskEndDate"
+             value={endDate}
+             onChange={(e) => setEndDate(e.target.value)}
+             className="mt-1 block w-full p-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm focus:ring-blue-500 focus:border-blue-500 bg-gray-50 dark:bg-gray-700 text-gray-900 dark:text-gray-100"
+             required
+           />
+         </div>
+       </div>
+       <div>
+         <label
+           htmlFor="taskStatus"
+           className="block text-sm font-medium text-gray-700 dark:text-gray-300"
+         >
+           Estado
+         </label>
+         <select
+           id="taskStatus"
+           value={status}
+           onChange={(e) => setStatus(e.target.value)}
+           className="mt-1 block w-full p-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm focus:ring-blue-500 focus:border-blue-500 bg-gray-50 dark:bg-gray-700 text-gray-900 dark:text-gray-100"
+         >
+           <option>To Do</option>
+           <option>In Progress</option>
+           <option>Done</option>
+         </select>
+       </div>
+       <div className="flex justify-end gap-2 mt-4">
+         <button
+           type="button"
+           onClick={onClose}
+           className="px-4 py-2 bg-gray-300 hover:bg-gray-400 text-gray-800 font-bold rounded-lg transition duration-300 ease-in-out"
+         >
+           Cancelar
+         </button>
+         <button
+           type="submit"
+           className="px-4 py-2 bg-blue-500 hover:bg-blue-600 text-white font-bold rounded-lg transition duration-300 ease-in-out"
+         >
+           {task ? "Guardar Cambios" : "Añadir Tarea"}
+         </button>
+       </div>
+     </form>
+   </Modal>
+ );
+};
+
+
+// Componente base para los modales
+const Modal = ({ title, children, onClose }) => {
+ return (
+   <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black bg-opacity-50">
+     <div className="relative bg-white dark:bg-gray-800 rounded-xl shadow-2xl w-full max-w-lg p-6">
+       <div className="flex justify-between items-center pb-3 border-b dark:border-gray-700">
+         <h3 className="text-xl font-bold text-gray-900 dark:text-gray-100">{title}</h3>
+         <button
+           onClick={onClose}
+           className="text-gray-500 hover:text-gray-800 dark:hover:text-gray-200 transition-colors duration-200"
+         >
+           <svg
+             xmlns="http://www.w3.org/2000/svg"
+             className="h-6 w-6"
+             fill="none"
+             viewBox="0 0 24 24"
+             stroke="currentColor"
+           >
+             <path
+               strokeLinecap="round"
+               strokeLinejoin="round"
+               strokeWidth={2}
+               d="M6 18L18 6M6 6l12 12"
+             />
+           </svg>
+         </button>
+       </div>
+       <div className="mt-4">{children}</div>
+     </div>
+   </div>
+ );
+};
+
+
+// Modal de interacción personalizado
+const CustomInteractionModal = ({
+ message,
+ onClose,
+ onConfirm,
+ showCancel,
+}) => {
+ const handleConfirm = () => {
+   if (onConfirm) {
+     onConfirm();
+   }
+   onClose();
+ };
+
+
+ return (
+   <Modal title="Aviso" onClose={onClose}>
+     <p className="text-gray-700 dark:text-gray-300 text-lg mb-6">
+       {message}
+     </p>
+     <div className="flex justify-end gap-2">
+       {showCancel && (
+         <button
+           onClick={onClose}
+           className="px-4 py-2 bg-gray-300 hover:bg-gray-400 text-gray-800 font-bold rounded-lg transition duration-300 ease-in-out"
+         >
+           Cancelar
+         </button>
+       )}
+       <button
+         onClick={handleConfirm}
+         className="px-4 py-2 bg-blue-500 hover:bg-blue-600 text-white font-bold rounded-lg transition duration-300 ease-in-out"
+       >
+         Aceptar
+       </button>
+     </div>
+   </Modal>
+ );
+};
+
+
+export default App;
